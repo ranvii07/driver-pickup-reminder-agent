@@ -564,3 +564,51 @@ def test_trial_inline_twiml_rejection_gets_a_human_explanation():
     err = RuntimeError("Invalid or disallowed parameters provided - trial accounts "
                        "have limited parameter access")
     assert "TWIML_URL" in reminder.explain_twilio_error(err)
+
+
+# --------------------------------------------------------------------------
+# Single-instance lock (guards overlapping cron ticks)
+# --------------------------------------------------------------------------
+
+
+def test_second_sweep_is_refused_while_the_first_holds_the_lock(tmp_path):
+    lock = str(tmp_path / "reminder.lock")
+    with reminder.single_instance(lock) as first:
+        assert first is True
+        with reminder.single_instance(lock) as second:
+            assert second is False
+
+
+def test_lock_is_released_when_the_sweep_finishes(tmp_path):
+    lock = str(tmp_path / "reminder.lock")
+    with reminder.single_instance(lock) as acquired:
+        assert acquired is True
+    with reminder.single_instance(lock) as again:
+        assert again is True
+
+
+def test_lock_is_released_even_if_the_sweep_raises(tmp_path):
+    lock = str(tmp_path / "reminder.lock")
+    with pytest.raises(RuntimeError):
+        with reminder.single_instance(lock):
+            raise RuntimeError("boom")
+    with reminder.single_instance(lock) as again:
+        assert again is True
+
+
+def test_stale_lock_from_a_killed_process_is_reclaimed(tmp_path):
+    """A crash must not wedge the agent permanently."""
+    lock = tmp_path / "reminder.lock"
+    lock.write_text("99999")
+    with reminder.single_instance(str(lock), stale_after=0) as acquired:
+        assert acquired is True
+
+
+def test_unverified_recipient_error_gets_a_human_explanation():
+    """Twilio reports this as 573002 with different wording to 21219."""
+    err = RuntimeError('HTTP 422 error: No Twilio trial phone number is assigned '
+                       'for voice calls to this destination number. Please add '
+                       'the "to" number as a verified recipient.')
+    err.code = 573002
+    assert "verified" in reminder.explain_twilio_error(err)
+    assert "TEST_OVERRIDE_NUMBER" in reminder.explain_twilio_error(err)

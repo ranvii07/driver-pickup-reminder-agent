@@ -56,6 +56,12 @@ than a repeat call.** If a row is stuck at `CALLING`, the fleet manager can see
 it in the sheet and call that driver themselves — which is exactly the visible,
 manual fallback you want for a rare failure.
 
+Only one sweep runs at a time (`reminder.lock`). Waiting for a call to finish
+can take up to a minute, so a tick can outlive the cron interval — and two
+overlapping ticks would both see a blank status and both dial. Claiming the row
+guards sequential re-runs; the lock guards concurrent ones. A lock left by a
+killed process is reclaimed after 15 minutes.
+
 **2. Every run is a full sweep, not a schedule.**
 The agent does not "wake up at T-30 for ride X". It asks, every minute, "which
 rides are due and unhandled?" This means there is **no retry logic anywhere in
@@ -106,6 +112,10 @@ Reminder Status | Call SID | Call Result | Last Updated
 The agent refuses to run if they are missing, and tells you so. It never
 changes the sheet's structure on its own — the sheet belongs to operations.
 
+`rides_seed.csv` in this repo is the sample sheet with those four columns
+already added. Import it (File → Import → Upload → *Replace spreadsheet*) and
+name the tab `Rides` to get a working sheet in one step.
+
 **3. Give the agent access to the sheet**
 
 1. Go to <https://console.cloud.google.com>, create (or pick) a project.
@@ -145,9 +155,9 @@ cp .env.example .env
 ```
 
 Fill in `SHEET_ID` (the long id in the sheet's URL), the three `TWILIO_*`
-values, and — while testing — set `TEST_OVERRIDE_NUMBER` to your own verified
-number. Every reminder is then redirected to your phone instead of the
-drivers' real numbers.
+values, and `TWIML_URL` if you are on a trial account (step 4). While testing,
+set `TEST_OVERRIDE_NUMBER` to your own verified number — every reminder is then
+redirected to your phone instead of the drivers' real numbers.
 
 **6. Schedule it**
 
@@ -169,7 +179,7 @@ this folder.
 python reminder.py                              # normal run
 python reminder.py --dry-run                    # everything except dialling
 python reminder.py --now "2026-08-21 08:35"     # pretend it is this time
-python -m pytest -q                             # 58 unit tests
+python -m pytest -q                             # 63 unit tests
 ```
 
 `--dry-run` still reads and writes the sheet — only the dial is skipped. It is
@@ -190,6 +200,10 @@ day against the sheet in a few seconds without waiting for real pickup times.
 4. Decline the call — the sheet records `no-answer` / `FAILED`.
 5. Set a row's pickup time to ~31 minutes from now, leave cron running, walk
    away. The call arrives unattended.
+
+The sample rows carry fixed dates, so running without `--now` marks them all
+`SKIPPED_TOO_LATE` — which is correct behaviour, not a bug. Use `--now`, or
+edit a pickup time to today, when you want a row to be due.
 
 Every run also appends to `reminders.log`.
 

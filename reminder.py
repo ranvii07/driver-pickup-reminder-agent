@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import os
 import re
@@ -75,6 +76,13 @@ CALL_POLL_INTERVAL = 3
 
 LOG_FILE = os.getenv("LOG_FILE", "reminders.log")
 
+# Only one sweep may run at a time. Waiting for a call to finish can take up to
+# CALL_POLL_SECONDS, so a tick can outlive the one-minute cron interval; two
+# overlapping ticks would both read a blank status and both dial the same
+# driver. Claiming the row guards sequential re-runs, not concurrent ones.
+LOCK_FILE = os.getenv("LOCK_FILE", "reminder.lock")
+LOCK_STALE_SECONDS = 900
+
 TZ = ZoneInfo(TIMEZONE)
 
 # --------------------------------------------------------------------------
@@ -118,6 +126,42 @@ def setup_logging() -> None:
         log.addHandler(file_handler)
     except OSError as exc:  # read-only dir, etc. Not worth failing the run.
         log.warning("could not open log file %s: %s", LOG_FILE, exc)
+
+
+@contextlib.contextmanager
+def single_instance(path: str = LOCK_FILE, stale_after: int = LOCK_STALE_SECONDS):
+    """Yield True if this process got the lock, False if a sweep is running.
+
+    A lock left behind by a killed process is reclaimed once it goes stale, so
+    a crash can never wedge the agent permanently.
+    """
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            age = time.time() - os.path.getmtime(path)
+        except OSError:
+            age = 0.0
+        if age < stale_after:
+            yield False
+            return
+        log.warning("reclaiming stale lock %s (%.0f s old)", path, age)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError:
+            yield False
+            return
+    try:
+        with contextlib.suppress(OSError):
+            os.write(fd, str(os.getpid()).encode())
+        yield True
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
 
 # --------------------------------------------------------------------------
@@ -359,7 +403,6 @@ class TwilioCaller:
         log.info("call placed sid=%s to=%s", sid, to)
 
         deadline = time.monotonic() + CALL_POLL_SECONDS
-        status = call.status
         while True:
             fetched = self._client.calls(sid).fetch()
             status = fetched.status
@@ -394,12 +437,14 @@ def build_caller(dry_run: bool):
 
 def explain_twilio_error(exc: Exception) -> str:
     code = getattr(exc, "code", None)
-    if code == 21219 or "not verified" in str(exc).lower():
+    text = str(exc).lower()
+    if code in (21219, 573002) or "not verified" in text or "verified recipient" in text:
         return (
-            "error: number not verified on Twilio trial. Verify it in the "
-            "Twilio console, or set TEST_OVERRIDE_NUMBER in .env"
+            "error: number not verified on Twilio trial. Trial accounts can only "
+            "call numbers verified in the Twilio console - verify it there, or "
+            "set TEST_OVERRIDE_NUMBER in .env to a number you have verified"
         )
-    if "limited parameter access" in str(exc):
+    if "limited parameter access" in text:
         return (
             "error: trial account rejected a call parameter. Inline TwiML is not "
             "allowed on trial - create a TwiML Bin and set TWIML_URL in .env "
@@ -548,9 +593,13 @@ def main(argv=None) -> int:
     # One try/except around the whole tick. If anything transient goes wrong,
     # the next run is 60 seconds away - that is the retry.
     try:
-        sheet = open_sheet()
-        caller = build_caller(dry_run)
-        summary = run_tick(sheet, caller, now)
+        with single_instance() as acquired:
+            if not acquired:
+                log.info("previous sweep still running; skipping this tick")
+                return 0
+            sheet = open_sheet()
+            caller = build_caller(dry_run)
+            summary = run_tick(sheet, caller, now)
     except ConfigError as exc:
         # Setup problem: exit 2 and stay quiet on the next tick until fixed.
         log.error("setup incomplete: %s", exc)
