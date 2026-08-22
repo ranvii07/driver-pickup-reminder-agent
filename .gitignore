@@ -1,0 +1,6 @@
+.env
+service_account.json
+reminders.log
+__pycache__/
+.pytest_cache/
+*.pyc
