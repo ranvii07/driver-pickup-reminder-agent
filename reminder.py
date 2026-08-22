@@ -81,7 +81,6 @@ LOG_FILE = os.getenv("LOG_FILE", "reminders.log")
 # overlapping ticks would both read a blank status and both dial the same
 # driver. Claiming the row guards sequential re-runs, not concurrent ones.
 LOCK_FILE = os.getenv("LOCK_FILE", "reminder.lock")
-LOCK_STALE_SECONDS = 900
 
 TZ = ZoneInfo(TIMEZONE)
 
@@ -128,40 +127,56 @@ def setup_logging() -> None:
         log.warning("could not open log file %s: %s", LOG_FILE, exc)
 
 
+if os.name == "nt":
+    import msvcrt
+
+    def _try_lock(handle) -> bool:
+        # Locks one byte at the *current* position, so always lock byte 0 -
+        # otherwise two processes at different offsets would not conflict.
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+else:
+    import fcntl
+
+    def _try_lock(handle) -> bool:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+
 @contextlib.contextmanager
-def single_instance(path: str = LOCK_FILE, stale_after: int = LOCK_STALE_SECONDS):
+def single_instance(path: str = LOCK_FILE):
     """Yield True if this process got the lock, False if a sweep is running.
 
-    A lock left behind by a killed process is reclaimed once it goes stale, so
-    a crash can never wedge the agent permanently.
+    This takes a real OS-level lock rather than just creating a file. The
+    kernel drops the lock when the process exits *however* it exits - clean
+    return, exception, Ctrl+C, killed terminal - so an interrupted run can
+    never leave the agent wedged behind a lock nobody owns. The file itself is
+    left on disk; it carries no meaning, only the lock does.
     """
+    handle = open(path, "a+")
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        try:
-            age = time.time() - os.path.getmtime(path)
-        except OSError:
-            age = 0.0
-        if age < stale_after:
+        if not _try_lock(handle):
             yield False
             return
-        log.warning("reclaiming stale lock %s (%.0f s old)", path, age)
-        with contextlib.suppress(OSError):
-            os.unlink(path)
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # Write past the locked byte so the pid breadcrumb never disturbs it.
+            handle.seek(1)
+            handle.truncate()
+            handle.write(f" {os.getpid()}")
+            handle.flush()
         except OSError:
-            yield False
-            return
-    try:
-        with contextlib.suppress(OSError):
-            os.write(fd, str(os.getpid()).encode())
+            pass  # the lock is what matters; the pid is only a breadcrumb
         yield True
     finally:
-        with contextlib.suppress(OSError):
-            os.close(fd)
-        with contextlib.suppress(OSError):
-            os.unlink(path)
+        handle.close()  # closing releases the OS lock
 
 
 # --------------------------------------------------------------------------

@@ -59,8 +59,14 @@ manual fallback you want for a rare failure.
 Only one sweep runs at a time (`reminder.lock`). Waiting for a call to finish
 can take up to a minute, so a tick can outlive the cron interval — and two
 overlapping ticks would both see a blank status and both dial. Claiming the row
-guards sequential re-runs; the lock guards concurrent ones. A lock left by a
-killed process is reclaimed after 15 minutes.
+guards sequential re-runs; the lock guards concurrent ones.
+
+It takes a real OS-level file lock rather than just creating a file. My first
+attempt did the latter, with a timeout to expire abandoned locks, and it wedged
+the agent the first time I interrupted a run mid-call: the file outlived the
+process that made it. The kernel releases an OS lock however the process
+exits — clean return, exception, Ctrl+C, closed terminal — so an interrupted
+run cannot block the next one, and the expiry logic disappears entirely.
 
 **2. Every run is a full sweep, not a schedule.**
 The agent does not "wake up at T-30 for ride X". It asks, every minute, "which
@@ -179,7 +185,7 @@ this folder.
 python reminder.py                              # normal run
 python reminder.py --dry-run                    # everything except dialling
 python reminder.py --now "2026-08-21 08:35"     # pretend it is this time
-python -m pytest -q                             # 63 unit tests
+python -m pytest -q                             # 64 unit tests
 ```
 
 `--dry-run` still reads and writes the sheet — only the dial is skipped. It is

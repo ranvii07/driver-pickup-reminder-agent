@@ -6,6 +6,10 @@ Two groups:
      so the whole decision logic can be exercised without Google or Twilio.
 """
 
+import pathlib
+import subprocess
+import sys
+import textwrap
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -571,12 +575,54 @@ def test_trial_inline_twiml_rejection_gets_a_human_explanation():
 # --------------------------------------------------------------------------
 
 
-def test_second_sweep_is_refused_while_the_first_holds_the_lock(tmp_path):
+def test_second_sweep_is_refused_while_another_process_holds_the_lock(tmp_path):
+    """The case that matters: two cron ticks overlapping.
+
+    Uses a real subprocess, because the guarantee is between processes - on
+    Windows a process is allowed to re-lock a file it already holds.
+    """
     lock = str(tmp_path / "reminder.lock")
-    with reminder.single_instance(lock) as first:
-        assert first is True
+    holder = subprocess.Popen(
+        [sys.executable, "-c", textwrap.dedent(f"""
+            import sys, time
+            sys.path.insert(0, {str(pathlib.Path(reminder.__file__).parent)!r})
+            import reminder
+            with reminder.single_instance({lock!r}) as got:
+                print("LOCKED" if got else "FAILED", flush=True)
+                time.sleep(30)
+        """)],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "LOCKED"
         with reminder.single_instance(lock) as second:
             assert second is False
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+def test_lock_is_free_again_once_the_holding_process_dies(tmp_path):
+    """The bug this replaced: a killed run must not wedge the agent."""
+    lock = str(tmp_path / "reminder.lock")
+    holder = subprocess.Popen(
+        [sys.executable, "-c", textwrap.dedent(f"""
+            import sys, time
+            sys.path.insert(0, {str(pathlib.Path(reminder.__file__).parent)!r})
+            import reminder
+            with reminder.single_instance({lock!r}) as got:
+                print("LOCKED" if got else "FAILED", flush=True)
+                time.sleep(30)
+        """)],
+        stdout=subprocess.PIPE, text=True,
+    )
+    assert holder.stdout.readline().strip() == "LOCKED"
+    holder.kill()          # simulate Ctrl+C / closed terminal / crash
+    holder.wait(timeout=10)
+
+    # The lock file is still on disk, but the OS released the lock.
+    with reminder.single_instance(lock) as acquired:
+        assert acquired is True
 
 
 def test_lock_is_released_when_the_sweep_finishes(tmp_path):
@@ -596,11 +642,15 @@ def test_lock_is_released_even_if_the_sweep_raises(tmp_path):
         assert again is True
 
 
-def test_stale_lock_from_a_killed_process_is_reclaimed(tmp_path):
-    """A crash must not wedge the agent permanently."""
+def test_leftover_lock_file_does_not_block_a_new_sweep(tmp_path):
+    """A crash must not wedge the agent.
+
+    The OS drops the lock when a process dies, so a lock *file* left on disk by
+    a killed run means nothing on its own - only a live lock blocks.
+    """
     lock = tmp_path / "reminder.lock"
-    lock.write_text("99999")
-    with reminder.single_instance(str(lock), stale_after=0) as acquired:
+    lock.write_text("99999")  # as a killed process would leave it
+    with reminder.single_instance(str(lock)) as acquired:
         assert acquired is True
 
 
